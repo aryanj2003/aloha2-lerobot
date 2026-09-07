@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """Convert ALOHA HDF5 episodes to a LeRobot dataset.
 
-The default target is a LeRobot v2.1-compatible layout because many VLA and
-imitation-learning repos still use that format. The v3.0 target uses the
-official current LeRobot API.
+The default target is LeRobot v3.0 using the official API.
+Pass --format v2.1 for the legacy export layout.
 """
 
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import subprocess
 import sys
@@ -20,23 +18,15 @@ import numpy as np
 
 def import_lerobot_dataset():
     try:
-        from lerobot.datasets import LeRobotDataset
+        from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
     except ImportError as exc:
         raise SystemExit(
-            "Could not import lerobot. Install the official LeRobot package in this environment, "
+            "Could not import lerobot. Use Python >=3.10 with the official LeRobot v3 package, "
             "then rerun this converter."
         ) from exc
+    if CODEBASE_VERSION != "v3.0":
+        raise SystemExit(f"Expected LeRobot v3.0, installed writer uses {CODEBASE_VERSION}")
     return LeRobotDataset
-
-
-def call_with_supported_kwargs(fn, **kwargs):
-    signature = inspect.signature(fn)
-    supported = {
-        key: value
-        for key, value in kwargs.items()
-        if key in signature.parameters and value is not None
-    }
-    return fn(**supported)
 
 
 def dataset_root(output_root: Path | None, repo_id: str) -> Path:
@@ -110,13 +100,15 @@ def discover_schema(episode_paths: list[Path], include_velocity: bool, include_e
     return {"features": features, "camera_names": camera_names}
 
 
-def v3_features(features: dict) -> dict:
+def v3_features(features: dict, use_videos: bool = True) -> dict:
     converted = {}
     for key, value in features.items():
         feature = dict(value)
         if key.startswith("observation.images."):
-            feature["dtype"] = "image"
+            feature["dtype"] = "video" if use_videos else "image"
             feature.pop("info", None)
+        else:
+            feature["names"] = feature_names(feature["shape"][0])
         converted[key] = feature
     return converted
 
@@ -376,6 +368,7 @@ def add_episode_v30(
             frame = {
                 "observation.state": np.asarray(qpos[frame_idx], dtype=np.float32),
                 "action": np.asarray(action[frame_idx], dtype=np.float32),
+                "task": task,
             }
             if qvel is not None:
                 frame["observation.velocity"] = np.asarray(qvel[frame_idx], dtype=np.float32)
@@ -385,12 +378,7 @@ def add_episode_v30(
                 frame[f"observation.images.{camera_name}"] = root[f"/observations/images/{camera_name}"][frame_idx]
             dataset.add_frame(frame)
 
-    save_episode = dataset.save_episode
-    signature = inspect.signature(save_episode)
-    if "task" in signature.parameters:
-        save_episode(task=task)
-    else:
-        save_episode()
+    dataset.save_episode()
     return frame_count
 
 
@@ -409,31 +397,26 @@ def convert_v30(
 ) -> tuple[int, int]:
     LeRobotDataset = import_lerobot_dataset()
 
-    dataset = call_with_supported_kwargs(
-        LeRobotDataset.create,
+    dataset = LeRobotDataset.create(
         repo_id=repo_id,
-        root=output_root,
+        root=dataset_root(output_root, repo_id),
         fps=fps,
-        features=v3_features(schema["features"]),
+        features=v3_features(schema["features"], use_videos=not no_videos),
         robot_type=robot_type,
         use_videos=not no_videos,
         image_writer_threads=image_writer_threads,
     )
 
     total_frames = 0
-    for episode_path in episode_paths:
-        frames = add_episode_v30(
-            dataset,
-            episode_path,
-            schema["camera_names"],
-            task,
-            include_velocity,
-            include_effort,
-        )
-        total_frames += frames
-        print(f"Converted {episode_path.name}: {frames} frames")
-
-    if hasattr(dataset, "finalize"):
+    try:
+        for episode_path in episode_paths:
+            frames = add_episode_v30(
+                dataset, episode_path, schema["camera_names"], task,
+                include_velocity, include_effort,
+            )
+            total_frames += frames
+            print(f"Converted {episode_path.name}: {frames} frames")
+    finally:
         dataset.finalize()
     return len(episode_paths), total_frames
 
@@ -453,7 +436,7 @@ def main() -> None:
     parser.add_argument("--input-dir", type=Path, required=True, help="Directory containing episode_*.hdf5 files.")
     parser.add_argument("--repo-id", required=True, help="LeRobot dataset repo id, e.g. hong/aloha_real_stack.")
     parser.add_argument("--output-root", type=Path, default=None, help="Local output directory. Defaults to repo_id with '/' replaced by '_'.")
-    parser.add_argument("--format", choices=["v2.1", "v3.0"], default="v2.1", help="Output format. v2.1 is the default for VLA compatibility.")
+    parser.add_argument("--format", choices=["v2.1", "v3.0"], default="v3.0", help="Output format (default: v3.0).")
     parser.add_argument("--task", required=True, help="Natural-language task description stored in metadata.")
     parser.add_argument("--fps", type=int, default=50, help="Dataset frame rate. ALOHA real collection uses 50 Hz.")
     parser.add_argument("--robot-type", default="aloha", help="Robot type metadata.")
@@ -472,6 +455,10 @@ def main() -> None:
         help="Delete source episode_*.hdf5 files after conversion finalizes successfully.",
     )
     args = parser.parse_args()
+    if args.fps <= 0 or args.image_writer_threads < 0:
+        parser.error("FPS must be positive and image-writer-threads must be nonnegative.")
+    if args.also_migrate_v21_to_v30 and args.format != "v2.1":
+        parser.error("--also-migrate-v21-to-v30 requires --format v2.1.")
 
     episode_paths = sorted(args.input_dir.glob("episode_*.hdf5"))
     schema = discover_schema(episode_paths, args.include_velocity, args.include_effort)

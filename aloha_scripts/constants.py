@@ -98,6 +98,42 @@ TASK_CONFIGS = {
         'camera_names': ['cam_high', 'cam_low']
 
     },
+    
+    'dlo_route':{
+        'dataset_dir': DATA_DIR + '/dlo_route',
+        'num_episodes': 20,
+        'episode_len': 800,
+        # 'camera_names': ['cam_high', 'cam_low']
+        'camera_names': ['cam_high', 'cam_low', 'cam_left_wrist', 'cam_right_wrist']
+
+    },
+    
+    'cube_transfer_stack':{
+        'dataset_dir': DATA_DIR + '/cube_transfer_stack',
+        'num_episodes': 20,
+        'episode_len': 500,
+        # 'camera_names': ['cam_high', 'cam_low']
+        'camera_names': ['cam_high', 'cam_low', 'cam_left_wrist', 'cam_right_wrist']
+
+    },
+    
+    'banana_insertion':{
+        'dataset_dir': DATA_DIR + '/banana_insertion',
+        'num_episodes': 20,
+        'episode_len': 300,
+        # 'camera_names': ['cam_high', 'cam_low']
+        'camera_names': ['cam_high', 'cam_low', 'cam_left_wrist', 'cam_right_wrist']
+
+    },
+    
+    'cube_toss_pick_place':{
+        'dataset_dir': DATA_DIR + '/cube_toss_pick_place',
+        'num_episodes': 20,
+        'episode_len': 350,
+        # 'camera_names': ['cam_high', 'cam_low']
+        'camera_names': ['cam_high', 'cam_low', 'cam_left_wrist', 'cam_right_wrist']
+
+    },
 }
 
 ### ALOHA fixed constants

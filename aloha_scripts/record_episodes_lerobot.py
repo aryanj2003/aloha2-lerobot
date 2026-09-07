@@ -1,32 +1,22 @@
 #!/usr/bin/env python3
-"""Record real ALOHA episodes directly to a local LeRobot v2.1 dataset."""
+"""Record real ALOHA episodes directly to a local LeRobot v3.0 dataset."""
 
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 import time
 from pathlib import Path
 
-import cv2
 import numpy as np
 from tqdm import tqdm
 
 from constants import DT, START_ARM_POSE, TASK_CONFIGS
 from constants import MASTER_GRIPPER_JOINT_MID, PUPPET_GRIPPER_JOINT_CLOSE, PUPPET_GRIPPER_JOINT_OPEN
 from interbotix_xs_modules.arm import InterbotixManipulatorXS
-from lerobot_v21 import (
-    build_features,
-    default_dataset_root,
-    episode_start_index,
-    next_episode_index,
-    parquet_path,
-    push_dataset_to_hub,
-    remove_episode_files,
-    stats_for_array,
-    update_metadata,
-    video_path,
-    write_parquet,
-)
+from lerobot_v21 import default_dataset_root
+from lerobot_v30 import RecordingWriter
 from real_env import get_action, make_real_env
 from robot_utils import get_arm_gripper_positions
 from robot_utils import move_arms, move_grippers, torque_off, torque_on
@@ -87,52 +77,33 @@ def print_dt_diagnosis(actual_dt_history):
     return freq_mean
 
 
-def open_video_writers(dataset_root, episode_index, camera_names, images, fps):
-    writers = {}
+def recording_frame(obs, action, camera_names, task, include_velocity, include_effort):
+    frame = {
+        "observation.state": np.asarray(obs["qpos"], dtype=np.float32),
+        "action": np.asarray(action, dtype=np.float32),
+        "task": task,
+    }
+    if include_velocity:
+        frame["observation.velocity"] = np.asarray(obs["qvel"], dtype=np.float32)
+    if include_effort:
+        frame["observation.effort"] = np.asarray(obs["effort"], dtype=np.float32)
     for camera_name in camera_names:
-        image = images[camera_name]
+        image = obs["images"][camera_name]
         if image is None:
             raise RuntimeError(f"No image received for camera {camera_name}")
-        height, width = image.shape[:2]
-        path = video_path(dataset_root, episode_index, camera_name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), int(fps), (int(width), int(height)))
-        if not writer.isOpened():
-            raise RuntimeError(f"Could not open video writer for {path}")
-        writers[camera_name] = writer
-    return writers
-
-
-def write_video_frame(writers, camera_names, images):
-    for camera_name in camera_names:
-        image = images[camera_name]
-        writers[camera_name].write(image[:, :, [2, 1, 0]])
-
-
-def close_video_writers(writers):
-    for writer in writers.values():
-        writer.release()
+        frame[f"observation.images.{camera_name}"] = image
+    return frame
 
 
 def capture_one_episode(
     max_timesteps,
     camera_names,
-    dataset_root,
-    episode_index,
+    writer_python,
+    writer_config,
     task,
-    fps,
-    robot_type,
     include_velocity,
     include_effort,
 ):
-    print(f"LeRobot dataset root: {dataset_root}")
-    print(f"Episode index: {episode_index}")
-
-    base_frame_index = episode_start_index(dataset_root, episode_index)
-    removed_paths = remove_episode_files(dataset_root, episode_index)
-    if removed_paths:
-        print(f"Overwriting existing episode {episode_index}: removed {len(removed_paths)} old files.")
-
     master_bot_left = InterbotixManipulatorXS(
         robot_model="wx250s",
         group_name="arm",
@@ -149,102 +120,37 @@ def capture_one_episode(
     )
     env = make_real_env(init_node=False, setup_robots=False)
 
-    opening_ceremony(master_bot_left, master_bot_right, env.puppet_bot_left, env.puppet_bot_right)
-
-    ts = env.reset(fake=True)
-    rows = []
-    qpos_history = []
-    action_history = []
-    qvel_history = []
-    effort_history = []
-    actual_dt_history = []
-    writers = None
-    image_shape = None
-
+    sample = recording_frame(
+        env.get_observation(), get_action(master_bot_left, master_bot_right),
+        camera_names, task, include_velocity, include_effort,
+    )
+    writer = RecordingWriter(writer_python, writer_config, sample)
+    print(f"Episode index: {writer.episode_index}")
     try:
-        for frame_index in tqdm(range(max_timesteps)):
-            t0 = time.time()
-            action = get_action(master_bot_left, master_bot_right)
-            t1 = time.time()
+        opening_ceremony(master_bot_left, master_bot_right, env.puppet_bot_left, env.puppet_bot_right)
 
-            obs = ts.observation
-            if writers is None:
-                writers = open_video_writers(dataset_root, episode_index, camera_names, obs["images"], fps)
-                image_shape = obs["images"][camera_names[0]].shape
+        ts = env.reset(fake=True)
+        actual_dt_history = []
+        try:
+            for _ in tqdm(range(max_timesteps)):
+                t0 = time.time()
+                action = get_action(master_bot_left, master_bot_right)
+                t1 = time.time()
+                obs = ts.observation
+                frame = recording_frame(obs, action, camera_names, task, include_velocity, include_effort)
+                writer.add_frame(frame)
+                ts = env.step(action)
+                actual_dt_history.append([t0, t1, time.time()])
+        finally:
+            torque_on(master_bot_left)
+            torque_on(master_bot_right)
+            move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)
 
-            qpos = np.asarray(obs["qpos"], dtype=np.float32)
-            row = {
-                "observation.state": qpos.tolist(),
-                "action": np.asarray(action, dtype=np.float32).tolist(),
-                "timestamp": np.float32(frame_index / fps).item(),
-                "frame_index": int(frame_index),
-                "episode_index": int(episode_index),
-                "index": int(base_frame_index + frame_index),
-                "task_index": 0,
-            }
-            if include_velocity:
-                qvel = np.asarray(obs["qvel"], dtype=np.float32)
-                row["observation.velocity"] = qvel.tolist()
-                qvel_history.append(qvel)
-            if include_effort:
-                effort = np.asarray(obs["effort"], dtype=np.float32)
-                row["observation.effort"] = effort.tolist()
-                effort_history.append(effort)
-
-            write_video_frame(writers, camera_names, obs["images"])
-            rows.append(row)
-            qpos_history.append(qpos)
-            action_history.append(np.asarray(action, dtype=np.float32))
-
-            ts = env.step(action)
-            t2 = time.time()
-            actual_dt_history.append([t0, t1, t2])
+        print_dt_diagnosis(actual_dt_history)
+        writer.finish()
+        print(f"Saved LeRobot v3.0 episode {writer.episode_index} with {max_timesteps} frames.")
     finally:
-        if writers is not None:
-            close_video_writers(writers)
-
-    torque_on(master_bot_left)
-    torque_on(master_bot_right)
-    move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)
-
-    print_dt_diagnosis(actual_dt_history)
-
-    if not rows:
-        raise RuntimeError("No frames were recorded.")
-
-    features = build_features(
-        camera_names,
-        image_shape,
-        len(rows[0]["observation.state"]),
-        len(rows[0]["action"]),
-        fps,
-        include_velocity,
-        include_effort,
-    )
-
-    write_parquet(parquet_path(dataset_root, episode_index), rows)
-
-    episode_stats = {
-        "observation.state": stats_for_array(np.stack(qpos_history)),
-        "action": stats_for_array(np.stack(action_history)),
-    }
-    if include_velocity:
-        episode_stats["observation.velocity"] = stats_for_array(np.stack(qvel_history))
-    if include_effort:
-        episode_stats["observation.effort"] = stats_for_array(np.stack(effort_history))
-
-    update_metadata(
-        dataset_root,
-        episode_index,
-        len(rows),
-        task,
-        fps,
-        robot_type,
-        features,
-        episode_stats,
-    )
-    print(f"Saved LeRobot v2.1 episode {episode_index} with {len(rows)} frames.")
-    return True
+        writer.close()
 
 
 def resolve_dataset_root(args, task_config):
@@ -260,34 +166,40 @@ def main(args):
     dataset_root = resolve_dataset_root(args, task_config)
     max_timesteps = task_config["episode_len"]
     camera_names = task_config["camera_names"]
-    episode_index = args.episode_idx if args.episode_idx is not None else next_episode_index(dataset_root)
     task = args.task if args.task else args.task_name
-
+    if args.fps <= 0 or max_timesteps <= 0:
+        raise SystemExit("FPS and episode length must be positive.")
     if args.push_to_hub and not args.repo_id:
         raise SystemExit("--push-to-hub requires --repo-id.")
 
+    print(f"LeRobot v3.0 dataset root: {dataset_root}")
+    writer_config = {
+        "root": str(dataset_root.resolve()),
+        "repo_id": args.repo_id or f"local/{dataset_root.name}",
+        "episode_index": args.episode_idx,
+        "fps": args.fps,
+        "robot_type": args.robot_type,
+        "camera_names": camera_names,
+        "include_velocity": args.include_velocity,
+        "include_effort": args.include_effort,
+        "push_to_hub": args.push_to_hub,
+        "private": args.private,
+    }
     capture_one_episode(
         max_timesteps=max_timesteps,
         camera_names=camera_names,
-        dataset_root=dataset_root,
-        episode_index=episode_index,
+        writer_python=args.lerobot_python,
+        writer_config=writer_config,
         task=task,
-        fps=args.fps,
-        robot_type=args.robot_type,
         include_velocity=args.include_velocity,
         include_effort=args.include_effort,
     )
-
-    if args.push_to_hub:
-        print(f"Pushing LeRobot dataset to Hugging Face Hub: {args.repo_id}")
-        push_dataset_to_hub(dataset_root, args.repo_id, private=args.private)
-        print(f"Pushed dataset: https://huggingface.co/datasets/{args.repo_id}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--task_name", action="store", type=str, help="Task name from constants.py.", required=True)
-    parser.add_argument("--episode_idx", action="store", type=int, help="LeRobot episode index.", default=None)
+    parser.add_argument("--episode_idx", action="store", type=int, help="Next episode index; existing episodes cannot be overwritten.", default=None)
     parser.add_argument(
         "--repo-id",
         type=str,
@@ -301,6 +213,8 @@ if __name__ == "__main__":
         help="Override local LeRobot dataset root. If omitted with --repo-id, uses the LeRobot cache path.",
     )
     parser.add_argument("--task", type=str, default=None, help="Natural-language task stored in LeRobot metadata.")
+    parser.add_argument("--lerobot-python", default=os.environ.get("LEROBOT_PYTHON", sys.executable),
+                        help="Python >=3.10 executable with LeRobot v3 installed (or set LEROBOT_PYTHON).")
     parser.add_argument("--fps", type=int, default=50, help="Dataset frame rate.")
     parser.add_argument("--robot-type", type=str, default="aloha", help="Robot type metadata.")
     parser.add_argument("--include-velocity", action="store_true", help="Store observation.velocity.")

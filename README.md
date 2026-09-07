@@ -118,7 +118,7 @@ these devices.
 
 ### Software installation - Conda:
 
-Use the checked-in Conda environment file instead of installing the Python packages one by one. It reflects the working ``aloha`` environment on this machine, including the LeRobot direct-recording dependencies and CUDA 11.8 PyTorch wheels.
+Use the checked-in Conda environment file instead of installing the Python packages one by one. It reflects the working ``aloha`` environment on this machine, including the ROS recording dependencies and CUDA 11.8 PyTorch wheels.
 
     conda env create -f environment.yml
     conda activate aloha
@@ -128,6 +128,13 @@ If the environment already exists, update it with:
     conda env update -n aloha -f environment.yml
 
 ROS Noetic and Interbotix packages are still installed through the ROS workspace steps above, not by ``environment.yml``.
+
+LeRobot v3 requires Python 3.10 or newer, while the ROS ``aloha`` environment uses Python 3.8. Keep ROS in ``aloha`` and run the official dataset writer in a separate environment with LeRobot v3 installed. On this machine, ``aloha2-policy`` already provides it:
+
+    export LEROBOT_PYTHON=/media/hong/home/conda-envs/aloha2-policy/bin/python
+
+On another machine, set this to the Python executable in your LeRobot environment (for example one with ``lerobot==0.4.4`` installed). The recorder streams frames to that process over a local pipe; it does not write intermediate HDF5 files. You can also pass ``--lerobot-python /path/to/python`` directly. Conversion runs entirely in the LeRobot environment.
+
 
 ### Testing teleoperation
 
@@ -169,11 +176,10 @@ The ``one_side_teleop.py`` we ran is for testing teleoperation and has no data c
 This will store ``episode_<idx>.hdf5`` in the task's ``dataset_dir`` from ``constants.py``.
 To change the save directory, episode length, camera list, or other task params, edit ``TASK_CONFIGS`` in ``constants.py`` directly.
 
-To record directly to a local LeRobot v2.1 dataset instead of writing HDF5 first, run:
+To record directly to a local LeRobot v3.0 dataset instead of writing HDF5 first, set ``LEROBOT_PYTHON`` as above and run:
 
     python3 record_episodes_lerobot.py \
         --task_name <task name> \
-        --episode_idx 0 \
         --repo-id <hf_user>/<dataset_name> \
         --task "<short natural-language task description>"
 
@@ -181,13 +187,15 @@ With ``--repo-id``, the local dataset is written under ``HF_LEROBOT_HOME`` if se
 
     python3 record_episodes_lerobot.py \
         --task_name <task name> \
-        --episode_idx 0 \
         --repo-id <hf_user>/<dataset_name> \
         --task "<short natural-language task description>" \
         --push-to-hub
 
-This direct path writes Parquet state/action data plus per-camera MP4 videos and does not create ``episode_<idx>.hdf5``.
-If ``--episode_idx`` points to an existing LeRobot episode, the recorder overwrites that episode automatically.
+This direct path uses the official LeRobot API to write v3.0 Parquet data, MP4 videos, statistics, and episode/task metadata. Images are written asynchronously and videos are encoded when the episode is saved; finalization finishes before optional upload. No ``episode_<idx>.hdf5`` is created. Add ``--include-velocity --include-effort`` to retain those optional signals.
+
+Omitting ``--episode_idx`` appends the next episode. If supplied, it must equal the next episode index: overwriting an episode in shared v3 files is not supported. Use a new dataset root for v3 recordings; existing v2.1 roots are rejected. Keep FPS, robot type, cameras, and optional signals consistent when appending.
+
+``--fps`` controls dataset timestamps and video playback rate; actual collection also includes robot and writer latency. Check the printed average frequency on the real setup. The writer initializes and checks the sample schema before the opening ceremony. An interrupted capture is not committed; earlier completed episodes remain available. If the first capture is abandoned before saving starts, its newly created dataset directory is removed so the next run can retry. Files are retained for recovery if saving has already started.
 
 To delete a local direct LeRobot dataset, remove its local cache directory:
 
@@ -201,7 +209,7 @@ To visualize the episode collected, run:
 
     python3 visualize_episodes.py --dataset_dir <data save dir> --episode_idx 0
 
-To create a combined quick-look video from a direct LeRobot recording, run:
+For existing **v2.1** recordings, create a combined quick-look video with the legacy helper below. This helper does not support v3 shared video files; use a v3-capable LeRobot viewer for new recordings.
 
     python3 visualize_lerobot_episodes.py \
         --repo-id <hf_user>/<dataset_name> \
@@ -211,7 +219,7 @@ To replay the episode collected with real robot, run:
 
     python3 replay_episodes.py --dataset_dir <data save dir> --episode_idx 0
 
-To replay a direct LeRobot recording with the real robot, stop both ``one_side_teleop.py`` processes first, then run:
+For existing **v2.1** recordings, stop both ``one_side_teleop.py`` processes before replaying with the legacy helper below. This helper does not support v3 datasets.
 
     python3 replay_lerobot_episodes.py \
         --repo-id <hf_user>/<dataset_name> \
@@ -223,55 +231,34 @@ To lower 4 robots before e.g. cutting off power, run:
 
 ## Dataset conversion to LeRobot
 
-The conservative collection path is still available: record raw ALOHA episodes as ``.hdf5`` first, validate them, then convert them to LeRobot format for training. For routine collection after the robot setup is stable, ``record_episodes_lerobot.py`` can write LeRobot v2.1 directly and skip the temporary HDF5 file.
+``record_episodes_lerobot.py`` now collects directly in **LeRobot v3.0**. The older ``record_episodes.py`` and ``auto_record.sh`` still collect HDF5; convert those existing recordings with ``tools/convert_hdf5_to_lerobot.py``, which also defaults to **v3.0**.
 
-Current decision: use LeRobot v2.1 as the default converted format for VLA and imitation-learning compatibility. The official LeRobot docs describe v3.0 as the current scalable format and provide an official migration command from v2.1 to v3.0. I did not find an official v3.0 to v2.1 downgrade path, so the safer default is to produce v2.1 first, then migrate upward to v3.0 when a trainer or the official LeRobot repo needs it.
+V3 stores multiple episodes in shared Parquet/MP4 files and tracks episode boundaries in Parquet metadata. Both new paths use the official writer for indexing, task labels, image/state statistics, encoding, and finalization. See the [official v3 documentation](https://huggingface.co/docs/lerobot/lerobot-dataset-v3).
 
-Dataset v2.1 already stores low-dimensional signals in Parquet and camera streams as MP4, so it should still be much smaller than the raw uncompressed HDF5 image arrays. Dataset v3.0 improves scaling by grouping multiple episodes into larger Parquet/MP4 shards and moving episode boundaries into metadata.
+Run from the repository root, with ``LEROBOT_PYTHON`` set to your LeRobot environment's Python executable:
 
-Recommended workflow:
-
-    # 1. Inspect the raw HDF5 episodes
+    # Inspect raw recordings using the aloha environment
     python3 tools/inspect_aloha_hdf5.py <data save dir>
 
-    # 2. Convert to LeRobot v2.1, the default compatibility target
-    python3 tools/convert_hdf5_to_lerobot.py \
+    # Convert to v3.0 (default); output-root must be a new directory
+    "$LEROBOT_PYTHON" tools/convert_hdf5_to_lerobot.py \
         --input-dir <data save dir> \
         --repo-id <hf_user>/<dataset_name> \
-        --output-root <local lerobot output root> \
-        --task "<short natural-language task description>" \
-        --fps 50 \
-        --robot-type aloha
-
-    # 3. Smoke-check the converted dataset in LeRobot or the target trainer
-    python3 tools/validate_lerobot_dataset.py <hf_user>/<dataset_name> \
-        --root <local lerobot output root> \
-        --expected-fps 50
-
-To export v3.0 directly with the current official LeRobot API, pass ``--format v3.0``:
-
-    python3 tools/convert_hdf5_to_lerobot.py \
-        --input-dir <data save dir> \
-        --repo-id <hf_user>/<dataset_name> \
-        --output-root <local lerobot output root> \
-        --format v3.0 \
-        --task "<short natural-language task description>" \
-        --fps 50 \
-        --robot-type aloha
-
-To migrate a v2.1 dataset to v3.0 with the official LeRobot migration command, install a LeRobot version that includes v3.0 support and run:
-
-    python3 -m lerobot.datasets.v30.convert_dataset_v21_to_v30 --repo-id=<hf_user>/<dataset_name>
-
-For future conversion runs after this pipeline is trusted, add ``--delete-source-hdf5`` to delete raw HDF5 files after the converter finishes successfully:
-
-    python3 tools/convert_hdf5_to_lerobot.py \
-        --input-dir <data save dir> \
-        --repo-id <hf_user>/<dataset_name> \
-        --output-root <local lerobot output root> \
+        --output-root <new local lerobot output root> \
         --task "<short natural-language task description>" \
         --fps 50 \
         --robot-type aloha \
-        --delete-source-hdf5
+        --include-velocity --include-effort
 
-Only use ``--delete-source-hdf5`` after the workflow has already been validated on a smaller batch, because the HDF5 files are the raw capture source. Once the v2.1 output is validated and backed up, the HDF5 files do not need to be kept for normal training.
+    # Reopen and decode samples with the official loader
+    "$LEROBOT_PYTHON" tools/validate_lerobot_dataset.py <hf_user>/<dataset_name> \
+        --root <local lerobot output root> \
+        --expected-fps 50
+
+``--format v3.0`` is accepted explicitly. ``--format v2.1`` retains the legacy export for older trainers. ``--no-videos`` stores image features instead of MP4 for v3 only. Without ``--output-root``, conversion writes to the current directory under the repo ID with ``/`` replaced by ``_``.
+
+Source HDF5 files are kept by default. ``--delete-source-hdf5`` deletes them only after conversion finalizes successfully; validate a representative batch and back up the output before using that option.
+
+Hardware-free regression check (requires the LeRobot environment):
+
+    "$LEROBOT_PYTHON" tests/test_lerobot_v30.py

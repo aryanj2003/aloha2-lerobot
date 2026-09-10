@@ -193,7 +193,11 @@ With ``--repo-id``, the local dataset is written under ``HF_LEROBOT_HOME`` if se
 
 This direct path uses the official LeRobot API to write v3.0 Parquet data, MP4 videos, statistics, and episode/task metadata. Images are written asynchronously and videos are encoded when the episode is saved; finalization finishes before optional upload. No ``episode_<idx>.hdf5`` is created. Add ``--include-velocity --include-effort`` to retain those optional signals.
 
-Omitting ``--episode_idx`` appends the next episode. If supplied, it must equal the next episode index: overwriting an episode in shared v3 files is not supported. Use a new dataset root for v3 recordings; existing v2.1 roots are rejected. Keep FPS, robot type, cameras, and optional signals consistent when appending.
+Omitting ``--episode_idx`` appends the next episode. With N saved episodes, ``--episode_idx 0`` through ``N-1`` replaces that episode, ``N`` appends, and negative indices or indices above N are rejected. A replacement receives the current ``--task`` label and may have a different length. Keep FPS, robot type, cameras, and optional signals consistent; existing v2.1 roots are rejected.
+
+Overwrites are saved in a temporary sibling copy before replacing the dataset directory. Interrupted capture leaves the original intact. This needs space for a second dataset copy and rewrites numeric data and normalization statistics, including quantiles, to keep them consistent with the replacement. Existing videos are retained without re-encoding, including unused clips from replaced episodes. Once saving starts, failures retain the staged replacement and report its recovery path; a failed directory swap also retains any original backup. Avoid concurrent writers to the same dataset.
+
+An overwrite also leaves a hidden sibling ``.<dataset-name>.hub-cleanup-pending`` marker. The next upload through either recorder or converter removes obsolete remote shards, even if the overwrite was performed offline and more episodes were appended afterward. The marker is removed only after that upload succeeds.
 
 ``--fps`` controls dataset timestamps and video playback rate; actual collection also includes robot and writer latency. Check the printed average frequency on the real setup. The writer initializes and checks the sample schema before the opening ceremony. An interrupted capture is not committed; earlier completed episodes remain available. If the first capture is abandoned before saving starts, its newly created dataset directory is removed so the next run can retry. Files are retained for recovery if saving has already started.
 
@@ -258,6 +262,14 @@ Run from the repository root, with ``LEROBOT_PYTHON`` set to your LeRobot enviro
 ``--format v3.0`` is accepted explicitly. ``--format v2.1`` retains the legacy export for older trainers. ``--no-videos`` stores image features instead of MP4 for v3 only. Without ``--output-root``, conversion writes to the current directory under the repo ID with ``/`` replaced by ``_``.
 
 Source HDF5 files are kept by default. ``--delete-source-hdf5`` deletes them only after conversion finalizes successfully; validate a representative batch and back up the output before using that option.
+
+To append newly collected HDF5 episodes to a v3.0 export, rerun the conversion command with the same ``--output-root`` and ``--resume``. The converter skips filenames recorded in ``meta/hdf5_sources.json`` and appends unseen filenames; keep source filenames unique and do not reuse them for different recordings. Direct recordings can be appended between conversions without adding entries to this source history. Existing episodes retain their task labels, and ``--task`` applies to new episodes. FPS, robot type, cameras, optional signals and image/video format must match.
+
+Conversion uploads to the Hub by default. Add ``--no-push-to-hub`` to save locally. A hidden sibling file, ``.<output-root-name>.conversion-upload-pending``, tracks deferred or failed uploads; rerunning with ``--resume`` retries the upload even when no new HDF5 files remain. After a successful upload, a resume with no new files makes no Hub calls. The regression checks disable or mock uploads.
+
+Conversion journals planned source filenames in ``meta/hdf5_conversion_pending.json`` before saving. Resume reconciles that journal against finalized episode metadata and physical Parquet frame indices before atomically updating source history. Orphan, missing or duplicate rows stop recovery without changing the data or journal; inspect the retained dataset before retrying. Direct recording is blocked until the journal is reconciled. Upload-only resume reads the existing dataset schema, so it also works after ``--no-push-to-hub --delete-source-hdf5`` removed the inputs.
+
+For an older export without source history, keep all original HDF5 files and give new episodes higher filename numbers. The first resume selects the lowest-numbered originals, restores the old converter's lexicographic order, and verifies their state/action arrays before adopting their filenames; mismatches stop conversion. For nonnumeric filenames, the originals must remain first in lexicographic order. Resume is not supported for v2.1 or together with ``--delete-source-hdf5``.
 
 Hardware-free regression check (requires the LeRobot environment):
 

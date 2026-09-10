@@ -90,7 +90,7 @@ def main():
                 writer.close()
         verify(direct)
         before = (direct / "meta/info.json").read_bytes()
-        for overrides in ({"episode_index": 0}, {"fps": 25}, {"include_effort": False}):
+        for overrides in ({"episode_index": -1}, {"episode_index": 3}, {"fps": 25}, {"include_effort": False}):
             try:
                 check_target(dict(config, **overrides))
             except ValueError:
@@ -143,6 +143,7 @@ def main():
             sys.executable, str(ROOT / "tools/convert_hdf5_to_lerobot.py"),
             "--input-dir", str(raw), "--repo-id", "local/test", "--output-root", str(converted),
             "--task", "pick up the block", "--include-velocity", "--include-effort",
+            "--no-push-to-hub",
         ], check=True)
         # Append to converter output too: both producers must have compatible schemas.
         writer = RecordingWriter(sys.executable, dict(config, root=str(converted)), frame(0))
@@ -160,6 +161,7 @@ def main():
                 sys.executable, str(ROOT / "tools/convert_hdf5_to_lerobot.py"),
                 "--input-dir", str(raw), "--repo-id", "local/test", "--output-root", str(output),
                 "--task", "pick up the block", *options,
+                "--no-push-to-hub",
             ], check=True)
             info = json.loads((output / "meta/info.json").read_text())
             assert info["codebase_version"] == version and info["total_frames"] == 3

@@ -7,6 +7,7 @@ import pickle
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from lerobot_v21 import feature_names
@@ -41,6 +42,8 @@ def frame_features(frame):
 
 def check_target(config):
     root = Path(config["root"])
+    if (root / "meta/hdf5_conversion_pending.json").exists():
+        raise ValueError("Interrupted HDF5 conversion: rerun the converter with --resume before recording.")
     info_path = root / "meta" / "info.json"
     if info_path.exists():
         info = json.loads(info_path.read_text())
@@ -61,18 +64,177 @@ def check_target(config):
         if root.exists():
             raise ValueError("New dataset output root must not already exist.")
         next_index = 0
-    if config["episode_index"] not in (None, next_index):
-        raise ValueError(f"v3 recording is append-only; next episode index is {next_index}.")
-    return next_index
+    index = config["episode_index"]
+    if index is None:
+        return next_index
+    if not 0 <= index <= next_index:
+        raise ValueError(f"Episode index {index} is out of range; use 0 through {next_index} (append).")
+    return index
+
+
+def replace_appended_episode(root, target):
+    """Replace target with the just-appended episode, retaining all encoded videos."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.dataset as pads
+    import pyarrow.parquet as pq
+    from lerobot.datasets.compute_stats import aggregate_stats, get_feature_stats
+    from lerobot.datasets.io_utils import write_stats
+    from lerobot.utils.utils import unflatten_dict
+
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    last = info["total_episodes"] - 1
+    episode_files = sorted((root / "meta/episodes").rglob("*.parquet"))
+    episode_schema = pa.unify_schemas([pq.read_schema(path) for path in episode_files])
+    episodes = pads.dataset(episode_files, schema=episode_schema, format="parquet").to_table().to_pylist()
+    episodes = {row["episode_index"]: row for row in episodes}
+    data = pads.dataset(root / "data", format="parquet")
+    rebuilt = root / "replacement-data"
+    rebuilt.mkdir()
+    metadata, stats = [], []
+    offset = 0
+    # ponytail: rewrite numeric data once; videos stay byte-identical. Optimize shards if this gets slow.
+    for index in range(last):
+        source_index = last if index == target else index
+        row = episodes[source_index]
+        table = data.to_table(filter=pads.field("episode_index") == source_index).sort_by("frame_index")
+        length = len(table)
+        for key, values in (("episode_index", np.full(length, index)), ("index", np.arange(offset, offset + length))):
+            column = table.schema.get_field_index(key)
+            table = table.set_column(column, table.schema.field(key), pa.array(values, type=table.schema.field(key).type))
+        # Recompute numeric statistics, including quantiles absent from older exports.
+        for key in table.column_names:
+            if info["features"][key]["dtype"] in ("video", "image", "string"):
+                continue
+            values = np.asarray(table[key].to_pylist())
+            row.update({f"stats/{key}/{stat}": value.tolist()
+                        for stat, value in get_feature_stats(values, axis=0, keepdims=values.ndim == 1).items()})
+        chunk, file_index = divmod(index, info["chunks_size"])
+        path = rebuilt / f"chunk-{chunk:03d}" / f"file-{file_index:03d}.parquet"
+        path.parent.mkdir(exist_ok=True)
+        pq.write_table(table, path)
+        row.update({
+            "episode_index": index, "data/chunk_index": chunk, "data/file_index": file_index,
+            "dataset_from_index": offset, "dataset_to_index": offset + length,
+            "meta/episodes/chunk_index": 0, "meta/episodes/file_index": 0,
+        })
+        metadata.append(row)
+        stats.append(unflatten_dict({
+            k: np.asarray(v) for k, v in row.items()
+            if k.startswith("stats/") and v is not None
+        })["stats"])
+        offset += length
+    # Resume allocates videos after the last logical episode's file. Keep that file last
+    # physically too, otherwise a later append could overwrite an earlier replacement.
+    rebuilt_videos = root / "replacement-videos"
+    for key, feature in info["features"].items():
+        if feature["dtype"] != "video":
+            continue
+        chunk_key, file_key = f"videos/{key}/chunk_index", f"videos/{key}/file_index"
+        def video_path(row):
+            return root / info["video_path"].format(video_key=key, chunk_index=row[chunk_key], file_index=row[file_key])
+        references = {video_path(row): row["episode_index"] for row in metadata}
+        paths = sorted((root / "videos" / key).rglob("*.mp4"))
+        mapping = {}
+        for number, path in enumerate(sorted(paths, key=lambda p: references.get(p, -1))):
+            chunk, file_index = divmod(number, info["chunks_size"])
+            destination = rebuilt_videos / key / f"chunk-{chunk:03d}" / f"file-{file_index:03d}.mp4"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(destination)
+            mapping[path] = chunk, file_index
+        for row in metadata:
+            row[chunk_key], row[file_key] = mapping[video_path(row)]
+    shutil.rmtree(root / "videos")
+    rebuilt_videos.rename(root / "videos")
+    shutil.rmtree(root / "data")
+    rebuilt.rename(root / "data")
+    shutil.rmtree(root / "meta/episodes")
+    meta_path = root / "meta/episodes/chunk-000/file-000.parquet"
+    meta_path.parent.mkdir(parents=True)
+    pq.write_table(pa.Table.from_pylist(metadata), meta_path)
+    info.update(total_episodes=last, total_frames=offset, splits={"train": f"0:{last}"})
+    info_path.write_text(json.dumps(info, indent=2) + "\n")
+    write_stats(aggregate_stats(stats), root)
 
 
 def writer_main():
+    # Stage overwrites so any capture/save failure leaves the original dataset untouched.
+    config = pickle.load(sys.stdin.buffer)
+    root = Path(config["root"])
+    if not root.exists():
+        backups = list(root.parent.glob(f".{root.name}.overwrite-*/original"))
+        if backups:
+            raise RuntimeError(f"Interrupted dataset replacement: restore {backups[0]} to {root} before recording.")
+    index = check_target(config)
+    info_path = root / "meta/info.json"
+    overwrite = info_path.exists() and index < json.loads(info_path.read_text())["total_episodes"]
+    if not overwrite:
+        return record_dataset(config, index)
+    staging = Path(tempfile.mkdtemp(prefix=f".{root.name}.overwrite-", dir=root.parent))
+    candidate, backup = staging / "dataset", staging / "original"
+    replacement_config = dict(config, root=str(candidate), push_to_hub=False)
+    try:
+        shutil.copytree(root, candidate)
+        with contextlib.redirect_stdout(sys.stderr):
+            print(f"Replacing episode {index}; original dataset stays intact until saving completes.")
+        record_dataset(replacement_config, index)
+        replace_appended_episode(candidate, index)
+        # Open the result before publishing it to catch invalid metadata or frame indexing.
+        cls = import_dataset()
+        cls(repo_id=config["repo_id"], root=candidate, video_backend="pyav")
+        hub_cleanup_marker(root).touch()
+        root.rename(backup)
+        try:
+            candidate.rename(root)
+        except BaseException:
+            backup.rename(root)
+            raise
+        shutil.rmtree(backup)
+        if config["push_to_hub"]:
+            push_dataset(cls(repo_id=config["repo_id"], root=root), config["private"])
+    finally:
+        if backup.exists():
+            print(f"Original dataset retained for recovery at {backup}", file=sys.stderr)
+        elif replacement_config.get("_save_started") and candidate.exists():
+            print(f"Replacement data retained for recovery at {candidate}", file=sys.stderr)
+        else:
+            shutil.rmtree(staging)
+
+
+def hub_cleanup_marker(root):
+    root = Path(root)
+    return root.with_name(f".{root.name}.hub-cleanup-pending")
+
+
+def push_dataset(dataset, private=False):
+    marker = hub_cleanup_marker(dataset.root)
+    if marker.exists():
+        push_replacement(dataset, private)
+        marker.unlink()
+    else:
+        dataset.push_to_hub(private=private)
+
+
+def push_replacement(dataset, private):
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    api.create_repo(repo_id=dataset.repo_id, repo_type="dataset", private=private, exist_ok=True)
+    # Remove obsolete shards in the same commit as their replacements. The regular
+    # push then updates LeRobot's card/version tag and reuses the already uploaded files.
+    api.upload_folder(
+        repo_id=dataset.repo_id, repo_type="dataset", folder_path=dataset.root,
+        delete_patterns=["data/**", "meta/episodes/**", "videos/**"], ignore_patterns=["images/"],
+    )
+    dataset.push_to_hub(private=private)
+
+
+def record_dataset(config, next_index):
     # Pickle is used only on private pipes to our own child process, never for dataset input.
     source, reply = sys.stdin.buffer, sys.stdout.buffer
     with contextlib.redirect_stdout(sys.stderr):
-        config = pickle.load(source)
         cls = import_dataset()
-        next_index = check_target(config)
         root = Path(config["root"])
         new_dataset = not root.exists()
         features = config["features"]
@@ -111,7 +273,7 @@ def writer_main():
                     if not frame_count:
                         raise ValueError("No frames were recorded.")
                     # Once saving starts, retain files for recovery even if saving fails.
-                    save_started = True
+                    save_started = config["_save_started"] = True
                     dataset.save_episode()
                     saved = True
                     break
@@ -127,7 +289,7 @@ def writer_main():
             if new_dataset and not save_started and root.is_dir():
                 shutil.rmtree(root)
         if config["push_to_hub"]:
-            dataset.push_to_hub(private=config["private"])
+            push_dataset(dataset, config["private"])
 
 
 class RecordingWriter:

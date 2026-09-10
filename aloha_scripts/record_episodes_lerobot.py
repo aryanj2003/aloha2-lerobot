@@ -16,7 +16,7 @@ from constants import DT, START_ARM_POSE, TASK_CONFIGS
 from constants import MASTER_GRIPPER_JOINT_MID, PUPPET_GRIPPER_JOINT_CLOSE, PUPPET_GRIPPER_JOINT_OPEN
 from interbotix_xs_modules.arm import InterbotixManipulatorXS
 from lerobot_v21 import default_dataset_root
-from lerobot_v30 import RecordingWriter
+from lerobot_v30 import RecordingWriter, check_target
 from real_env import get_action, make_real_env
 from robot_utils import get_arm_gripper_positions
 from robot_utils import move_arms, move_grippers, torque_off, torque_on
@@ -185,6 +185,10 @@ def main(args):
         "push_to_hub": args.push_to_hub,
         "private": args.private,
     }
+    try:
+        check_target(writer_config)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     capture_one_episode(
         max_timesteps=max_timesteps,
         camera_names=camera_names,
@@ -199,7 +203,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--task_name", action="store", type=str, help="Task name from constants.py.", required=True)
-    parser.add_argument("--episode_idx", action="store", type=int, help="Next episode index; existing episodes cannot be overwritten.", default=None)
+    parser.add_argument("--episode_idx", action="store", type=int, help="Replace an existing episode, or append at the next index. Omit to append; gaps are rejected.", default=None)
     parser.add_argument(
         "--repo-id",
         type=str,

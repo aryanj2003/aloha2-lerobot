@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "aloha_scripts"))
+from lerobot_v30 import hub_cleanup_marker, push_dataset
 
 
 def import_lerobot_dataset():
@@ -382,6 +386,55 @@ def add_episode_v30(
     return frame_count
 
 
+def write_json_atomic(path, value):
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w") as stream:
+        json.dump(value, stream, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+
+
+def recover_conversion(root):
+    """Commit only journaled sources whose episode metadata was finalized."""
+    journal_path = root / "meta/hdf5_conversion_pending.json"
+    if not journal_path.exists():
+        return
+    import pyarrow.dataset as pads
+
+    journal = json.loads(journal_path.read_text())
+    info = json.loads((root / "meta/info.json").read_text())
+    count = info["total_episodes"]
+    added = count - journal["base_count"]
+    if not 0 <= added <= len(journal["pending_sources"]):
+        raise ValueError("Conversion journal does not match episode count; inspect the retained dataset.")
+    lengths = np.empty(0, dtype=np.int64)
+    if count:
+        episodes = pads.dataset(root / "meta/episodes", format="parquet").to_table(columns=["episode_index", "length"])
+        if sorted(episodes["episode_index"].to_pylist()) != list(range(count)) or sum(episodes["length"].to_pylist()) != info["total_frames"]:
+            raise ValueError("Episode metadata is incomplete; inspect the retained dataset before resuming.")
+        lengths = episodes.sort_by("episode_index")["length"].to_numpy()
+    if np.any(lengths < 0) or lengths.sum() != info["total_frames"]:
+        raise ValueError("Episode lengths do not match total frames; inspect the retained dataset.")
+    data_files = sorted((root / "data").rglob("*.parquet"))
+    if not data_files and info["total_frames"]:
+        raise ValueError("Episode data is missing; inspect the retained dataset before resuming.")
+    if data_files:
+        rows = pads.dataset(data_files, format="parquet").to_table(columns=["index", "episode_index", "frame_index"])
+        indices = np.arange(info["total_frames"], dtype=np.int64)
+        expected = {
+            "index": indices,
+            "episode_index": np.repeat(np.arange(count), lengths),
+            "frame_index": indices - np.repeat(np.cumsum(lengths) - lengths, lengths),
+        }
+        if any(not np.array_equal(rows[key].to_numpy(), values) for key, values in expected.items()):
+            raise ValueError("Physical episode data does not match committed metadata; journal retained. Inspect orphan, missing or duplicate rows before resuming.")
+    sources = journal["sources"] + journal["pending_sources"][:added]
+    write_json_atomic(root / "meta/hdf5_sources.json", sources)
+    journal_path.unlink()
+
+
 def convert_v30(
     episode_paths: list[Path],
     schema: dict,
@@ -394,30 +447,111 @@ def convert_v30(
     include_effort: bool,
     no_videos: bool,
     image_writer_threads: int,
+    resume: bool = False,
+    push_to_hub: bool = True,
 ) -> tuple[int, int]:
     LeRobotDataset = import_lerobot_dataset()
-
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        root=dataset_root(output_root, repo_id),
-        fps=fps,
-        features=v3_features(schema["features"], use_videos=not no_videos),
-        robot_type=robot_type,
-        use_videos=not no_videos,
-        image_writer_threads=image_writer_threads,
-    )
+    root = dataset_root(output_root, repo_id)
+    features = v3_features(schema["features"], use_videos=not no_videos) if schema is not None else None
+    sources_path = root / "meta/hdf5_sources.json"
+    pending_upload = root.with_name(f".{root.name}.conversion-upload-pending")
+    sources = []
+    if resume and root.exists():
+        info = json.loads((root / "meta/info.json").read_text())
+        if info["codebase_version"] != "v3.0" or (features is not None and (info["fps"] != fps or info["robot_type"] != robot_type)):
+            raise ValueError("Resume requires matching v3.0 format, FPS and robot type.")
+        recover_conversion(root)
+        stored = {k: v for k, v in info["features"].items() if k == "action" or k.startswith("observation.")}
+        if features is None:
+            features = stored
+        if stored.keys() != features.keys() or any(
+            stored[k]["dtype"] != v["dtype"] or tuple(stored[k]["shape"]) != tuple(v["shape"])
+            for k, v in features.items()
+        ):
+            raise ValueError("Resume requires matching cameras, signals, shapes and image/video format.")
+        if sources_path.exists():
+            sources = json.loads(sources_path.read_text())
+        else:
+            # Older exports have no source filenames. New recordings normally have higher numbers.
+            import pyarrow.dataset as pads
+            count = info["total_episodes"]
+            if count > len(episode_paths):
+                raise ValueError("Resume of an older export requires all original HDF5 files.")
+            try:
+                original_paths = sorted(sorted(episode_paths, key=lambda p: int(p.stem[8:]))[:count])
+            except ValueError:
+                original_paths = episode_paths[:count]
+            data = pads.dataset(root / "data", format="parquet")
+            h5py = require_h5py()
+            for index, path in enumerate(original_paths):
+                rows = data.to_table(
+                    columns=["frame_index", "observation.state", "action"],
+                    filter=pads.field("episode_index") == index,
+                ).sort_by("frame_index")
+                with h5py.File(path, "r") as source:
+                    for key, hdf5_key in (("observation.state", "observations/qpos"), ("action", "action")):
+                        if not np.array_equal(
+                            np.asarray(rows[key].to_pylist(), dtype=np.float32),
+                            np.asarray(source[hdf5_key], dtype=np.float32), equal_nan=True,
+                        ):
+                            raise ValueError(
+                                f"Cannot identify original source for episode {index}: {path.name} differs. "
+                                "For older exports, retain the original files and use higher numbers for new episodes."
+                            )
+                sources.append(path.name)
+        if len(sources) > info["total_episodes"]:
+            raise ValueError("Source history does not match saved episodes; inspect the dataset before resuming.")
+        converted_names = set(sources)
+        episode_paths = [p for p in episode_paths if p.name not in converted_names]
+        print(f"Already converted: {len(sources)} episodes; new: {len(episode_paths)}")
+        if not episode_paths:
+            write_json_atomic(sources_path, sources)
+            print("No new episodes to convert.")
+            if push_to_hub and (pending_upload.exists() or hub_cleanup_marker(root).exists()):
+                push_dataset(LeRobotDataset(repo_id=repo_id, root=root))
+                pending_upload.unlink(missing_ok=True)
+            return 0, 0
+        if hasattr(LeRobotDataset, "resume"):
+            dataset = LeRobotDataset.resume(repo_id=repo_id, root=root, image_writer_threads=image_writer_threads)
+        else:
+            dataset = LeRobotDataset(repo_id=repo_id, root=root)
+            dataset.start_image_writer(num_threads=image_writer_threads)
+    else:
+        if features is None:
+            raise ValueError("Upload-only resume requires an existing dataset output root.")
+        dataset = LeRobotDataset.create(
+            repo_id=repo_id,
+            root=root,
+            fps=fps,
+            features=features,
+            robot_type=robot_type,
+            use_videos=not no_videos,
+            image_writer_threads=image_writer_threads,
+        )
 
     total_frames = 0
     try:
+        pending_upload.touch()
+        write_json_atomic(root / "meta/hdf5_conversion_pending.json", {
+            "base_count": dataset.meta.total_episodes,
+            "sources": sources,
+            "pending_sources": [path.name for path in episode_paths],
+        })
         for episode_path in episode_paths:
             frames = add_episode_v30(
                 dataset, episode_path, schema["camera_names"], task,
                 include_velocity, include_effort,
             )
             total_frames += frames
+            sources.append(episode_path.name)
             print(f"Converted {episode_path.name}: {frames} frames")
     finally:
         dataset.finalize()
+        recover_conversion(root)
+
+    if push_to_hub:
+        push_dataset(dataset)
+        pending_upload.unlink()
     return len(episode_paths), total_frames
 
 
@@ -437,6 +571,8 @@ def main() -> None:
     parser.add_argument("--repo-id", required=True, help="LeRobot dataset repo id, e.g. hong/aloha_real_stack.")
     parser.add_argument("--output-root", type=Path, default=None, help="Local output directory. Defaults to repo_id with '/' replaced by '_'.")
     parser.add_argument("--format", choices=["v2.1", "v3.0"], default="v3.0", help="Output format (default: v3.0).")
+    parser.add_argument("--resume", action="store_true", help="For v3.0: skip converted source filenames and append new episodes.")
+    parser.add_argument("--no-push-to-hub", action="store_true", help="For v3.0: save locally without uploading; a later --resume can upload it.")
     parser.add_argument("--task", required=True, help="Natural-language task description stored in metadata.")
     parser.add_argument("--fps", type=int, default=50, help="Dataset frame rate. ALOHA real collection uses 50 Hz.")
     parser.add_argument("--robot-type", default="aloha", help="Robot type metadata.")
@@ -459,9 +595,13 @@ def main() -> None:
         parser.error("FPS must be positive and image-writer-threads must be nonnegative.")
     if args.also_migrate_v21_to_v30 and args.format != "v2.1":
         parser.error("--also-migrate-v21-to-v30 requires --format v2.1.")
+    if args.resume and args.format != "v3.0":
+        parser.error("--resume requires --format v3.0.")
+    if args.resume and args.delete_source_hdf5:
+        parser.error("--resume cannot be combined with --delete-source-hdf5; retain sources for verification.")
 
     episode_paths = sorted(args.input_dir.glob("episode_*.hdf5"))
-    schema = discover_schema(episode_paths, args.include_velocity, args.include_effort)
+    schema = None if args.resume and not episode_paths else discover_schema(episode_paths, args.include_velocity, args.include_effort)
 
     if args.format == "v2.1":
         output_dir = dataset_root(args.output_root, args.repo_id)
@@ -491,6 +631,8 @@ def main() -> None:
             args.include_effort,
             args.no_videos,
             args.image_writer_threads,
+            resume=args.resume,
+            push_to_hub=not args.no_push_to_hub,
         )
         print(f"Converted {episode_count} episodes, {total_frames} frames to v3.0 repo {args.repo_id}")
 

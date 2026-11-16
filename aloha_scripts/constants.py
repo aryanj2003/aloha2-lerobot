@@ -1,7 +1,7 @@
 ### Task parameters
 
-DATA_DIR = '/media/hong/home1/hong0745/aloha/data'
-# DATA_DIR = '/media/hong/sunny/aloha_real_demo_data'
+DATA_DIR = '/media/hong/home/hong0745/aloha/data'
+
 TASK_CONFIGS = {
     'aloha_wear_shoe':{
         'dataset_dir': DATA_DIR + '/aloha_wear_shoe',
@@ -131,9 +131,43 @@ TASK_CONFIGS = {
         'num_episodes': 20,
         'episode_len': 350,
         # 'camera_names': ['cam_high', 'cam_low']
+        'camera_names': ['cam_high', 'cam_low', 'cam_left_wrist', 'cam_right_wrist']}
+    ,
+    
+    'cube_pp':{
+        'dataset_dir': DATA_DIR + '/cube_pp',
+        'num_episodes': 75,
+        'episode_len': 735,
         'camera_names': ['cam_high', 'cam_low', 'cam_left_wrist', 'cam_right_wrist']
 
     },
+    
+    'knot_tying':{
+        'dataset_dir': DATA_DIR + '/knot_tying',
+        'num_episodes': 175,
+        'episode_len': 700,
+        'camera_names': ['cam_high', 'cam_low', 'cam_left_wrist', 'cam_right_wrist']
+    },
+    
+    'stack_bimanual':{
+            'dataset_dir': DATA_DIR + '/stack_bimanual',
+            'num_episodes': 100 ,
+            'episode_len': 500,
+            'camera_names': ['cam_high', 'cam_low', 'cam_left_wrist', 'cam_right_wrist']},
+    
+    'stack_right':{
+                'dataset_dir': DATA_DIR + '/stack_right',
+                'num_episodes': 100 ,
+                'episode_len': 500,
+                'camera_names': ['cam_high', 'cam_low', 'cam_left_wrist', 'cam_right_wrist']},
+    
+    'banana_pp':{
+            'dataset_dir': DATA_DIR + '/banana_pp',
+            'num_episodes': 20,
+            'episode_len': 300,
+            'camera_names': ['cam_high', 'cam_low', 'cam_left_wrist', 'cam_right_wrist']
+    
+        },
 }
 
 ### ALOHA fixed constants
